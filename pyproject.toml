@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mask-mesh-fit"
+version = "0.1.0"
+description = "Mesh-guided repair of broken vessel segmentations: per-case deformable-mesh fitting and conservative connectivity repair for nnU-Net masks (ShapeMI 2026)."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Gniewosz Drwiega", email = "g.drwiega@sanoscience.org" },
+  { name = "Wojciech Szymanski" },
+  { name = "Marek Wodzinski" },
+]
+keywords = ["vessel segmentation", "mesh deformation", "topology", "nnU-Net", "medical imaging"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+dependencies = [
+  "torch>=2.4",
+  "lightning>=2.4",
+  "torch-geometric>=2.5",
+  "chamferdist>=1.0.3",
+  "numpy>=1.26",
+  "scipy>=1.12",
+  "scikit-image>=0.22",
+  "SimpleITK>=2.3",
+  "pyvista>=0.43",
+  "trimesh>=4.0",
+  "networkx>=3.2",
+  "pandas>=2.1",
+  "matplotlib>=3.8",
+  "tensorboard>=2.15",
+  "omegaconf>=2.3",
+  "tqdm>=4.66",
+]
+# Not on PyPI, install separately (see README):
+#   multigeomed  -> https://github.com/MWod/multigeomed_library
+#   pointnet2_ops -> https://github.com/erikwijmans/Pointnet2_PyTorch (optional, CUDA FPS)
+
+[project.urls]
+Homepage = "https://github.com/SanoScience/mind-the-gap-vessel-repair"
+Paper = "https://openreview.net/forum?id=BVB2SExfid"
+
+[tool.setuptools]
+packages = ["mask_mesh_fit", "mask_mesh_refine"]

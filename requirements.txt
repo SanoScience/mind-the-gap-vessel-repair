@@ -1,0 +1,25 @@
+# Tested with Python 3.12 and CUDA builds of PyTorch on Linux (WSL2), NVIDIA RTX 5090.
+# Install PyTorch first with the CUDA build that matches your driver:
+#   https://pytorch.org/get-started/locally/
+torch==2.9.1
+torchvision==0.24.1
+lightning==2.6.1
+torch-geometric==2.7.0
+numpy==2.2.6
+scipy==1.17.1
+scikit-image==0.26.0
+SimpleITK==2.5.2
+pyvista==0.47.1
+vtk==9.6.1
+trimesh==4.11.5
+networkx==3.4.2
+matplotlib==3.10.8
+tensorboard==2.20.0
+tqdm==4.67.3
+pandas>=2.1        # evaluation scripts only
+omegaconf          # mask_mesh_refine (experimental learned refiner) only
+
+# Installed from source, see README "Installation":
+#   multigeomed    https://github.com/MWod/multigeomed_library   (mesh regularisers, optional voxeliser)
+#   chamferdist    https://github.com/krrish94/chamferdist        (CUDA Chamfer distance, v1.0.3 used)
+#   pointnet2_ops  https://github.com/erikwijmans/Pointnet2_PyTorch (optional: CUDA farthest-point sampling)

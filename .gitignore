@@ -1,0 +1,25 @@
+# Experiment outputs and large artefacts (kept out of the public repository)
+runs/
+lightning_logs/
+tensorboard/
+*.pt
+*.ckpt
+*.nii
+*.nii.gz
+*.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Notebooks and editors
+.ipynb_checkpoints/
+*.ipynb
+.vscode/
+.idea/
+.DS_Store

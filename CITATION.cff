@@ -1,0 +1,41 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the ShapeMI 2026 paper below."
+title: "Mind the Gap: Mesh-Guided Repair of Broken Vessels"
+type: software
+version: 0.1.0
+date-released: 2026-09-27
+repository-code: "https://github.com/SanoScience/mind-the-gap-vessel-repair"
+url: "https://openreview.net/forum?id=BVB2SExfid"
+keywords:
+  - vessel segmentation
+  - mesh deformation
+  - topology
+  - tubular shapes
+  - nnU-Net
+authors:
+  - family-names: Drwiega
+    given-names: Gniewosz
+    orcid: "https://orcid.org/0000-0002-1968-2238"
+    affiliation: "Sano Centre for Computational Personalised Medicine, Krakow, Poland"
+    email: g.drwiega@sanoscience.org
+  - family-names: Szymanski
+    given-names: Wojciech
+    orcid: "https://orcid.org/0009-0001-2043-9104"
+    affiliation: "Sano Centre for Computational Personalised Medicine; AGH University of Krakow, Poland"
+  - family-names: Wodzinski
+    given-names: Marek
+    orcid: "https://orcid.org/0000-0002-8076-6246"
+    affiliation: "Sano Centre for Computational Personalised Medicine; AGH University of Krakow, Poland"
+preferred-citation:
+  type: conference-paper
+  title: "Mind the Gap: Mesh-Guided Repair of Broken Vessels"
+  authors:
+    - family-names: Drwiega
+      given-names: Gniewosz
+    - family-names: Szymanski
+      given-names: Wojciech
+    - family-names: Wodzinski
+      given-names: Marek
+  collection-title: "Shape in Medical Imaging (ShapeMI 2026), MICCAI 2026 Workshop"
+  year: 2026
+  url: "https://openreview.net/forum?id=BVB2SExfid"
