@@ -23,3 +23,7 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+
+# Local golden-test fixtures (point at run directories on this machine)
+tests/golden_manifest.json
+.pytest_cache/

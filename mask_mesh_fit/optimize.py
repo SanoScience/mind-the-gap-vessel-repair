@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from pathlib import Path
 from typing import Callable
 
 import lightning as L

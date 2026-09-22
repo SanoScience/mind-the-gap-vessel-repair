@@ -46,3 +46,7 @@ Paper = "https://openreview.net/forum?id=BVB2SExfid"
 
 [tool.setuptools]
 packages = ["mask_mesh_fit", "mask_mesh_refine"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["golden: byte-exact replay of stored runs, needs tests/golden_manifest.json"]

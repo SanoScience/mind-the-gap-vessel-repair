@@ -1,11 +1,16 @@
+"""Mesh voxelisation and signed-distance repair baselines.
+
+PyVista and torch are imported inside the backends that use them: the bridge repair
+only needs :func:`physical_ball_structure` from this module, so importing it must not
+drag in VTK or a deep-learning stack.
+"""
+
 from __future__ import annotations
 
 import warnings
 
 import numpy as np
-import pyvista as pv
 from scipy import ndimage
-import torch
 
 from .io_utils import ImageGeometry
 
@@ -65,6 +70,8 @@ def _voxelize_mesh_to_mask_pyvista(
     margin_voxels: int = 3,
     slab_depth: int = 16,
 ) -> np.ndarray:
+    import pyvista as pv
+
     index_xyz, lo_xyz, hi_xyz = _mesh_bbox_in_image(vertices_physical_xyz, geometry, margin_voxels)
 
     surface = pv.PolyData(index_xyz[:, [0, 1, 2]], _faces_to_pyvista(faces))
@@ -107,6 +114,8 @@ def _voxelize_mesh_to_mask_multigeomed(
     generous than PyVista. For conservative comparisons, keep using the pyvista
     backend.
     """
+    import torch
+
     try:
         from multigeomed.converters import from_surface_mesh
     except Exception as exc:  # pragma: no cover - depends on local env

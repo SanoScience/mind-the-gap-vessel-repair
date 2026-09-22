@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  synthetic:
+    name: synthetic tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # The repair stage itself needs neither a GPU nor a deep-learning stack, so the
+      # synthetic tests install only these. Mesh fitting needs the full requirements.
+      - name: Install test dependencies
+        run: pip install numpy scipy scikit-image SimpleITK networkx pytest pyflakes
+
+      - name: Check for undefined names
+        run: python -m pyflakes mask_mesh_fit tests
+
+      - name: Run synthetic tests
+        run: pytest tests -m "not golden" -q
+
+  # The golden tests replay stored runs and need nnU-Net predictions from the
+  # challenge datasets, which cannot be redistributed. Run them locally; see
+  # tests/README.md.

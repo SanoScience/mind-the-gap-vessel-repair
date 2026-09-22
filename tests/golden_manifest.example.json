@@ -1,0 +1,8 @@
+{
+  "_comment": "Copy to golden_manifest.json and edit. Paths are run directories containing metrics.json, relative to this file or absolute. Each run is replayed and compared byte for byte with its stored repaired mask.",
+  "runs": [
+    "../runs/Aorta_oof/D009_voxelrepair_mesh_path_connect_adaptive_artifactfilter_10_v4",
+    "../runs/TopCow/Oof_torus10k/topcow_ct_131_mesh_path_connect_adaptive_postcleanup_v1",
+    "../runs/Parse/Repair_compare_fomaml_train80_test20/PA000036_meshrepair_fomaml500"
+  ]
+}
