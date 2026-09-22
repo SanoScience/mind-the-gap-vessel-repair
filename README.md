@@ -303,6 +303,7 @@ mask_mesh_fit/
   losses.py                        Chamfer term and mesh regularisers (MultiGeoMed backend)
   repair_args.py                   repair command-line flags, shared by both entry points
   repair_pipeline.py               the repair stage itself, shared by both entry points
+  bridge_tube.py                   bridge rasterisation and the radius policy, shared by both strategies
   geometry.py, io_utils.py         templates, target surfaces, NIfTI geometry handling
   artifact_filter.py               component-distance filtering of false-positive islands
   mesh_path_repair.py              mesh-graph shortest-path bridges (aorta, TopCoW)

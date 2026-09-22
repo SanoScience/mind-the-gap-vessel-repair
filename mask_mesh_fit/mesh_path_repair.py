@@ -7,8 +7,14 @@ import numpy as np
 from scipy import ndimage
 from scipy.spatial import cKDTree
 
+from .bridge_tube import (
+    RadiusPolicy,
+    TubeTrial,
+    grow_tube_until_merge,
+    local_component_radius_mm,
+    voxel_step_mm,
+)
 from .io_utils import ImageGeometry
-from .voxelize import physical_ball_structure
 
 
 @dataclass(frozen=True)
@@ -35,6 +41,8 @@ def edge_index_from_faces(faces: np.ndarray) -> np.ndarray:
         axis=0,
     )
     return np.unique(edges, axis=0).T.astype(np.int64, copy=False)
+
+
 
 
 def _connectivity_structure(connectivity: int) -> np.ndarray:
@@ -230,90 +238,319 @@ def _mesh_vertex_component_anchors(
     return vertex_labels, vertex_dist, vertex_nearest_physical_xyz
 
 
-def _rasterize_path_tube(
-    path_vertices_physical_xyz: np.ndarray,
+@dataclass(frozen=True)
+class _BridgeOptions:
+    """Validated settings for mesh-graph bridge repair.
+
+    Everything about how wide a bridge may be lives in :class:`RadiusPolicy`, which
+    the endpoint strategy shares; the fields here are the ones specific to walking
+    the mesh graph.
+    """
+
+    anchor_mm: float
+    radius: RadiusPolicy
+    min_component_voxels: int
+    max_added_fraction: float
+    connectivity: int
+    path_selection: str
+    min_path_edges: int
+    max_mesh_edge_mm: float
+    edge_filter_fallback: str
+
+    @property
+    def edge_filtered(self) -> bool:
+        return self.path_selection == "edge_filtered_shortest"
+
+
+def _resolve_bridge_options(
     geometry: ImageGeometry,
+    *,
+    anchor_mm: float,
     radius_mm: float,
+    max_radius_mm: float | None,
+    min_accept_radius_mm: float | None,
+    radius_mode: str,
+    local_radius_window_mm: float,
+    radius_percentile: float,
+    radius_scale: float,
+    min_component_voxels: int,
+    max_added_fraction: float,
+    connectivity: int,
+    path_selection: str,
+    min_path_edges: int,
+    max_mesh_edge_mm: float,
+    edge_filter_fallback: str,
+) -> _BridgeOptions:
+    """Check the option values and settle the radius bounds."""
+    path_selection = str(path_selection).strip().lower()
+    if path_selection not in {"shortest", "edge_filtered_shortest"}:
+        raise ValueError("path_selection must be one of: shortest, edge_filtered_shortest")
+    edge_filter_fallback = str(edge_filter_fallback).strip().lower()
+    if edge_filter_fallback not in {"old_shortest", "skip"}:
+        raise ValueError("edge_filter_fallback must be one of: old_shortest, skip")
+
+    # With no explicit cap, a bridge may grow to the anchor distance plus one voxel:
+    # wide enough to reach the mask it was anchored to, and no wider.
+    auto_max_radius_mm = max(float(radius_mm), float(anchor_mm) + voxel_step_mm(geometry))
+    policy = RadiusPolicy.resolve(
+        geometry,
+        radius_mm=radius_mm,
+        max_radius_mm=max_radius_mm,
+        auto_max_radius_mm=auto_max_radius_mm,
+        min_accept_radius_mm=min_accept_radius_mm,
+        mode=radius_mode,
+        local_window_mm=local_radius_window_mm,
+        percentile=radius_percentile,
+        scale=radius_scale,
+    )
+
+    return _BridgeOptions(
+        anchor_mm=float(anchor_mm),
+        radius=policy,
+        min_component_voxels=int(min_component_voxels),
+        max_added_fraction=float(max_added_fraction),
+        connectivity=int(connectivity),
+        path_selection=path_selection,
+        min_path_edges=max(int(min_path_edges), 0),
+        max_mesh_edge_mm=float(max_mesh_edge_mm),
+        edge_filter_fallback=edge_filter_fallback,
+    )
+
+
+def _initial_bridge_metrics(
+    options: _BridgeOptions,
+    original_components: int,
+    max_added_voxels: int,
+) -> dict[str, object]:
+    """The metrics record, pre-filled with the settings the run used."""
+    metrics: dict[str, object] = {
+        "repair_status": "",
+        "original_components": int(original_components),
+        "repaired_components": int(original_components),
+        "accepted_paths": 0,
+        "rejected_paths": 0,
+        "added_voxels": 0,
+        "max_added_voxels": int(max_added_voxels),
+        "anchor_mm": options.anchor_mm,
+        "radius_mm": options.radius.radius_mm,
+        "max_radius_mm": options.radius.max_radius_mm,
+        "min_accept_radius_mm": options.radius.min_accept_radius_mm,
+        "radius_mode": options.radius.mode,
+        "local_radius_window_mm": options.radius.local_window_mm,
+        "radius_percentile": options.radius.percentile,
+        "radius_scale": options.radius.scale,
+        "min_component_voxels": options.min_component_voxels,
+        "max_added_fraction": options.max_added_fraction,
+        "connectivity": options.connectivity,
+        "paths": [],
+    }
+    if options.edge_filtered:
+        metrics.update(
+            {
+                "path_selection": options.path_selection,
+                "min_path_edges": options.min_path_edges,
+                "max_mesh_edge_mm": options.max_mesh_edge_mm,
+                "edge_filter_fallback": options.edge_filter_fallback,
+            }
+        )
+    return metrics
+
+
+@dataclass
+class _BridgeCandidate:
+    """The shortest mesh path found to one disconnected component."""
+
+    component_label: int
+    path: list[int]
+    path_length_mm: float
+    filtered_path_used: bool
+    fallback_used: bool
+
+
+def _select_best_path(
+    adjacency: list[list[tuple[int, float]]],
+    filtered_adjacency: list[list[tuple[int, float]]],
+    vertex_component: np.ndarray,
+    main_labels: set[int],
+    candidate_labels: list[int],
+    component_sizes: np.ndarray,
+    anchor_counts: dict[int, int],
+    options: _BridgeOptions,
+) -> tuple[_BridgeCandidate | None, list[dict[str, object]]]:
+    """Find the shortest mesh path from the main component to any candidate.
+
+    Returns the winner and a record for every candidate that had no usable path.
+    Under ``edge_filtered_shortest`` a candidate that only has an unfiltered path is
+    held back as a fallback and used only if nothing else wins.
+    """
+    rejections: list[dict[str, object]] = []
+    source_vertices = np.flatnonzero(np.isin(vertex_component, list(main_labels)))
+    if source_vertices.size == 0:
+        return None, rejections
+
+    best: _BridgeCandidate | None = None
+    fallback_best: _BridgeCandidate | None = None
+    for candidate_label in candidate_labels:
+        target_vertices = np.flatnonzero(vertex_component == int(candidate_label))
+        if options.edge_filtered:
+            path_result = _shortest_mesh_path_min_edges(
+                filtered_adjacency,
+                source_vertices,
+                target_vertices,
+                min_edges=options.min_path_edges,
+            )
+        else:
+            path_result = _shortest_mesh_path(adjacency, source_vertices, target_vertices)
+
+        if path_result is None:
+            if options.edge_filtered and options.edge_filter_fallback == "old_shortest":
+                fallback_result = _shortest_mesh_path(adjacency, source_vertices, target_vertices)
+                if fallback_result is not None:
+                    fallback_path, fallback_length = fallback_result
+                    if fallback_best is None or fallback_length < fallback_best.path_length_mm:
+                        fallback_best = _BridgeCandidate(
+                            component_label=int(candidate_label),
+                            path=fallback_path,
+                            path_length_mm=float(fallback_length),
+                            filtered_path_used=False,
+                            fallback_used=True,
+                        )
+                    continue
+            rejection: dict[str, object] = {
+                "component_label": int(candidate_label),
+                "status": "rejected_no_mesh_path",
+                "component_voxels": int(component_sizes[int(candidate_label)]),
+                "anchor_count": int(anchor_counts.get(int(candidate_label), 0)),
+            }
+            if options.edge_filtered:
+                rejection.update(
+                    {
+                        "path_selection": options.path_selection,
+                        "filtered_path_used": False,
+                        "fallback_used": False,
+                    }
+                )
+            rejections.append(rejection)
+            continue
+
+        path, path_length = path_result
+        if best is None or path_length < best.path_length_mm:
+            best = _BridgeCandidate(
+                component_label=int(candidate_label),
+                path=path,
+                path_length_mm=float(path_length),
+                filtered_path_used=options.edge_filtered,
+                fallback_used=False,
+            )
+
+    if best is None:
+        best = fallback_best
+    return best, rejections
+
+
+def _bridge_path_points(
+    path: list[int],
+    vertices_physical_xyz: np.ndarray,
+    vertex_nearest_physical_xyz: np.ndarray,
 ) -> np.ndarray:
-    output = np.zeros(geometry.shape_zyx, dtype=bool)
-    if path_vertices_physical_xyz.shape[0] == 0:
-        return output
-    index_xyz = geometry.physical_to_continuous_index_xyz(path_vertices_physical_xyz)
-    index_zyx = index_xyz[:, [2, 1, 0]]
-    shape = np.asarray(geometry.shape_zyx, dtype=np.int64)
-    spacing_zyx = np.asarray([geometry.spacing_xyz[2], geometry.spacing_xyz[1], geometry.spacing_xyz[0]], dtype=float)
-    min_spacing = float(max(np.min(spacing_zyx), 1e-6))
-    voxel_chunks: list[np.ndarray] = []
+    """Physical points of the bridge, extended to the mask voxels at both ends.
 
-    for start, end in zip(index_zyx[:-1], index_zyx[1:], strict=False):
-        physical_len = float(np.linalg.norm((end - start) * spacing_zyx))
-        steps = max(int(np.ceil(physical_len / (0.5 * min_spacing))), 1)
-        ts = np.linspace(0.0, 1.0, steps + 1, dtype=np.float32)
-        samples = start[None, :] * (1.0 - ts[:, None]) + end[None, :] * ts[:, None]
-        voxels = np.rint(samples).astype(np.int64)
-        in_bounds = np.all((voxels >= 0) & (voxels < shape[None, :]), axis=1)
-        voxels = voxels[in_bounds]
-        if voxels.size > 0:
-            voxel_chunks.append(voxels)
+    The mesh path runs between vertices near the two components, not to the mask
+    itself, so the nearest mask point at each end is prepended and appended. Without
+    that the rasterised tube can stop short and fail to merge.
+    """
+    path_points = vertices_physical_xyz[np.asarray(path, dtype=np.int64)]
+    if not path:
+        return path_points
 
-    if path_vertices_physical_xyz.shape[0] == 1:
-        voxel = np.rint(index_zyx[0]).astype(np.int64)
-        if np.all((voxel >= 0) & (voxel < shape)):
-            voxel_chunks.append(voxel[None, :])
-
-    if not voxel_chunks:
-        return output
-
-    voxels = np.unique(np.concatenate(voxel_chunks, axis=0), axis=0)
-    if float(radius_mm) <= 0:
-        output[voxels[:, 0], voxels[:, 1], voxels[:, 2]] = True
-        return output
-
-    radii_xyz = np.maximum(np.ceil(float(radius_mm) / np.asarray(geometry.spacing_xyz, dtype=float)).astype(int), 1)
-    margin_zyx = np.asarray([radii_xyz[2], radii_xyz[1], radii_xyz[0]], dtype=np.int64) + 1
-    lo = np.maximum(voxels.min(axis=0) - margin_zyx, 0)
-    hi = np.minimum(voxels.max(axis=0) + margin_zyx + 1, shape)
-    crop_slices = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi, strict=True))
-    crop_shape = tuple(int(b - a) for a, b in zip(lo, hi, strict=True))
-    centerline_crop = np.zeros(crop_shape, dtype=bool)
-    crop_voxels = voxels - lo[None, :]
-    centerline_crop[crop_voxels[:, 0], crop_voxels[:, 1], crop_voxels[:, 2]] = True
-    structure = physical_ball_structure(geometry.spacing_xyz, float(radius_mm))
-    output[crop_slices] = ndimage.binary_dilation(centerline_crop, structure=structure)
-    return output
+    start_anchor = vertex_nearest_physical_xyz[int(path[0])]
+    end_anchor = vertex_nearest_physical_xyz[int(path[-1])]
+    pieces = []
+    if np.all(np.isfinite(start_anchor)):
+        pieces.append(start_anchor[None, :])
+    pieces.append(path_points)
+    if np.all(np.isfinite(end_anchor)):
+        pieces.append(end_anchor[None, :])
+    return np.concatenate(pieces, axis=0)
 
 
-def _local_component_radius_mm(
-    labels: np.ndarray,
-    component_label: int,
-    anchor_physical_xyz: np.ndarray,
+def _endpoint_local_radii_mm(
+    path: list[int],
+    component_labels: np.ndarray,
+    vertex_component: np.ndarray,
+    vertex_nearest_physical_xyz: np.ndarray,
     geometry: ImageGeometry,
-    window_mm: float,
-    percentile: float,
-) -> float:
-    if int(component_label) <= 0 or not np.all(np.isfinite(anchor_physical_xyz)):
-        return float("nan")
-    anchor_index_xyz = geometry.physical_to_continuous_index_xyz(anchor_physical_xyz[None, :])[0]
-    anchor_zyx = np.rint(anchor_index_xyz[[2, 1, 0]]).astype(np.int64)
-    shape = np.asarray(labels.shape, dtype=np.int64)
-    if np.any(anchor_zyx < 0) or np.any(anchor_zyx >= shape):
-        return float("nan")
+    options: _BridgeOptions,
+) -> tuple[float, float]:
+    """Local vessel radius of the mask at each end of the bridge."""
+    main_radius = float("nan")
+    candidate_radius = float("nan")
+    if not path:
+        return main_radius, candidate_radius
 
-    spacing_zyx = np.asarray([geometry.spacing_xyz[2], geometry.spacing_xyz[1], geometry.spacing_xyz[0]], dtype=float)
-    margin_zyx = np.maximum(np.ceil(float(window_mm) / spacing_zyx).astype(np.int64), 1)
-    lo = np.maximum(anchor_zyx - margin_zyx, 0)
-    hi = np.minimum(anchor_zyx + margin_zyx + 1, shape)
-    crop_slices = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi, strict=True))
-    component_crop = labels[crop_slices] == int(component_label)
-    if not np.any(component_crop):
-        return float("nan")
+    main_label = int(vertex_component[int(path[0])])
+    candidate_label = int(vertex_component[int(path[-1])])
+    if main_label > 0:
+        main_radius = local_component_radius_mm(
+            component_labels,
+            main_label,
+            vertex_nearest_physical_xyz[int(path[0])],
+            geometry,
+            window_mm=options.radius.local_window_mm,
+            percentile=options.radius.percentile,
+        )
+    if candidate_label > 0:
+        candidate_radius = local_component_radius_mm(
+            component_labels,
+            candidate_label,
+            vertex_nearest_physical_xyz[int(path[-1])],
+            geometry,
+            window_mm=options.radius.local_window_mm,
+            percentile=options.radius.percentile,
+        )
+    return main_radius, candidate_radius
 
-    dist = ndimage.distance_transform_edt(component_crop, sampling=tuple(float(x) for x in spacing_zyx))
-    values = dist[component_crop]
-    values = values[np.isfinite(values) & (values > 0)]
-    if values.size == 0:
-        return float("nan")
-    return float(np.percentile(values, float(percentile)))
+
+def _bridge_metrics(
+    candidate: _BridgeCandidate,
+    trial: TubeTrial,
+    component_sizes: np.ndarray,
+    anchor_counts: dict[int, int],
+    vertices_physical_xyz: np.ndarray,
+    main_local_radius: float,
+    candidate_local_radius: float,
+    adaptive_accept_radius: float,
+    options: _BridgeOptions,
+) -> dict[str, object]:
+    """One bridge's record: which component, how long, how wide, how much it added."""
+    label = int(candidate.component_label)
+    metrics: dict[str, object] = {
+        "component_label": label,
+        "component_voxels": int(component_sizes[label]),
+        "anchor_count": int(anchor_counts.get(label, 0)),
+        "path_vertices": int(len(candidate.path)),
+        "path_length_mm": float(candidate.path_length_mm),
+        "added_voxels": int(trial.added_voxels),
+        "selected_radius_mm": float(trial.selected_radius_mm),
+        "radius_mode": options.radius.mode,
+        "adaptive_accept_radius_mm": float(adaptive_accept_radius),
+    }
+    if options.edge_filtered:
+        metrics.update(
+            {
+                "path_selection": options.path_selection,
+                "filtered_path_used": bool(candidate.filtered_path_used),
+                "fallback_used": bool(candidate.fallback_used),
+                **_path_edge_stats(vertices_physical_xyz, candidate.path),
+            }
+        )
+    if options.radius.adaptive:
+        metrics["main_local_radius_mm"] = float(main_local_radius)
+        metrics["candidate_local_radius_mm"] = float(candidate_local_radius)
+        metrics["local_radius_window_mm"] = options.radius.local_window_mm
+        metrics["radius_percentile"] = options.radius.percentile
+        metrics["radius_scale"] = options.radius.scale
+    return metrics
 
 
 def repair_mask_with_mesh_paths(
@@ -339,100 +576,74 @@ def repair_mask_with_mesh_paths(
     max_mesh_edge_mm: float = 0.0,
     edge_filter_fallback: str = "old_shortest",
 ) -> MeshPathRepairResult:
+    """Reconnect a fragmented mask along paths on the fitted mesh graph.
+
+    Disconnected components are anchored to nearby mesh vertices, and the shortest
+    path on the mesh graph between the main component and each candidate becomes a
+    bridge proposal. A proposal is rasterised as a thin tube and kept only if it
+    actually merges the two components while adding fewer voxels than the
+    foreground-growth budget allows. Accepted bridges are absorbed into the main
+    component and the search repeats until nothing is left to join.
+
+    The mesh is never voxelised: only accepted tubes are added to the mask.
+    """
     original = original_mask_zyx.astype(bool, copy=False)
-    radius_mode = str(radius_mode).strip().lower()
-    if radius_mode not in {"fixed", "adaptive_local"}:
-        raise ValueError("radius_mode must be one of: fixed, adaptive_local")
-    path_selection = str(path_selection).strip().lower()
-    if path_selection not in {"shortest", "edge_filtered_shortest"}:
-        raise ValueError("path_selection must be one of: shortest, edge_filtered_shortest")
-    edge_filter_fallback = str(edge_filter_fallback).strip().lower()
-    if edge_filter_fallback not in {"old_shortest", "skip"}:
-        raise ValueError("edge_filter_fallback must be one of: old_shortest, skip")
-    min_path_edges = max(int(min_path_edges), 0)
-    structure = _connectivity_structure(connectivity)
+    options = _resolve_bridge_options(
+        geometry,
+        anchor_mm=anchor_mm,
+        radius_mm=radius_mm,
+        max_radius_mm=max_radius_mm,
+        min_accept_radius_mm=min_accept_radius_mm,
+        radius_mode=radius_mode,
+        local_radius_window_mm=local_radius_window_mm,
+        radius_percentile=radius_percentile,
+        radius_scale=radius_scale,
+        min_component_voxels=min_component_voxels,
+        max_added_fraction=max_added_fraction,
+        connectivity=connectivity,
+        path_selection=path_selection,
+        min_path_edges=min_path_edges,
+        max_mesh_edge_mm=max_mesh_edge_mm,
+        edge_filter_fallback=edge_filter_fallback,
+    )
+
+    structure = _connectivity_structure(options.connectivity)
     component_labels, original_components = ndimage.label(original, structure=structure)
     component_labels = component_labels.astype(np.int32, copy=False)
     component_sizes = _component_sizes(component_labels, original_components)
     original_voxels = int(original.sum())
-    max_added_voxels = int(max(1, np.floor(float(max_added_fraction) * max(original_voxels, 1))))
-    spacing_zyx = np.asarray([geometry.spacing_xyz[2], geometry.spacing_xyz[1], geometry.spacing_xyz[0]], dtype=float)
-    radius_step_mm = float(max(np.min(spacing_zyx), 1e-6))
-    if max_radius_mm is None or float(max_radius_mm) <= 0:
-        max_radius_mm = max(float(radius_mm), float(anchor_mm) + radius_step_mm)
-    max_radius_mm = float(max(float(radius_mm), float(max_radius_mm)))
-    if min_accept_radius_mm is None or float(min_accept_radius_mm) <= 0:
-        min_accept_radius_mm = float(radius_mm)
-    min_accept_radius_mm = float(min(max(float(radius_mm), float(min_accept_radius_mm)), max_radius_mm))
+    max_added_voxels = int(max(1, np.floor(options.max_added_fraction * max(original_voxels, 1))))
 
     bridge_mask = np.zeros_like(original, dtype=bool)
     current = original.copy()
-    metrics: dict[str, object] = {
-        "repair_status": "",
-        "original_components": int(original_components),
-        "repaired_components": int(original_components),
-        "accepted_paths": 0,
-        "rejected_paths": 0,
-        "added_voxels": 0,
-        "max_added_voxels": int(max_added_voxels),
-        "anchor_mm": float(anchor_mm),
-        "radius_mm": float(radius_mm),
-        "max_radius_mm": float(max_radius_mm),
-        "min_accept_radius_mm": float(min_accept_radius_mm),
-        "radius_mode": radius_mode,
-        "local_radius_window_mm": float(local_radius_window_mm),
-        "radius_percentile": float(radius_percentile),
-        "radius_scale": float(radius_scale),
-        "min_component_voxels": int(min_component_voxels),
-        "max_added_fraction": float(max_added_fraction),
-        "connectivity": int(connectivity),
-        "paths": [],
-    }
-    if path_selection != "shortest":
-        metrics.update(
-            {
-                "path_selection": path_selection,
-                "min_path_edges": int(min_path_edges),
-                "max_mesh_edge_mm": float(max_mesh_edge_mm),
-                "edge_filter_fallback": edge_filter_fallback,
-            }
+    metrics = _initial_bridge_metrics(options, original_components, max_added_voxels)
+
+    def finished(status: str) -> MeshPathRepairResult:
+        metrics["repair_status"] = status
+        return MeshPathRepairResult(
+            repaired=current,
+            bridge_mask=bridge_mask,
+            component_labels=component_labels,
+            metrics=metrics,
         )
 
     if original_components <= 1:
-        metrics["repair_status"] = "noop_already_connected"
-        return MeshPathRepairResult(
-            repaired=current,
-            bridge_mask=bridge_mask,
-            component_labels=component_labels,
-            metrics=metrics,
-        )
+        return finished("noop_already_connected")
     if original_voxels <= 0:
-        metrics["repair_status"] = "noop_empty_mask"
-        return MeshPathRepairResult(
-            repaired=current,
-            bridge_mask=bridge_mask,
-            component_labels=component_labels,
-            metrics=metrics,
-        )
+        return finished("noop_empty_mask")
 
     if edge_index is None or np.asarray(edge_index).size == 0:
         edge_index = edge_index_from_faces(faces)
     adjacency = _mesh_adjacency(vertices_physical_xyz, np.asarray(edge_index, dtype=np.int64))
     if not any(adjacency):
-        metrics["repair_status"] = "noop_empty_mesh_graph"
-        return MeshPathRepairResult(
-            repaired=current,
-            bridge_mask=bridge_mask,
-            component_labels=component_labels,
-            metrics=metrics,
-        )
-    filtered_adjacency = _filter_adjacency_by_edge_length(adjacency, max_mesh_edge_mm)
+        return finished("noop_empty_mesh_graph")
+    filtered_adjacency = _filter_adjacency_by_edge_length(adjacency, options.max_mesh_edge_mm)
 
-    vertex_component, vertex_distance, vertex_nearest_physical_xyz = _mesh_vertex_component_anchors(
+    vertex_component, _vertex_distance, vertex_nearest_physical_xyz = _mesh_vertex_component_anchors(
         vertices_physical_xyz,
         component_labels,
         geometry,
-        anchor_mm=float(anchor_mm),
+        anchor_mm=options.anchor_mm,
     )
     anchor_counts = {
         int(label): int(np.count_nonzero(vertex_component == label))
@@ -443,16 +654,10 @@ def repair_mask_with_mesh_paths(
     component_order = [
         int(label)
         for label in np.argsort(component_sizes[1:])[::-1] + 1
-        if component_sizes[int(label)] >= int(min_component_voxels)
+        if component_sizes[int(label)] >= options.min_component_voxels
     ]
     if not component_order:
-        metrics["repair_status"] = "noop_no_large_components"
-        return MeshPathRepairResult(
-            repaired=current,
-            bridge_mask=bridge_mask,
-            component_labels=component_labels,
-            metrics=metrics,
-        )
+        return finished("noop_no_large_components")
 
     main_labels = {int(component_order[0])}
     candidate_labels = [label for label in component_order[1:] if anchor_counts.get(int(label), 0) > 0]
@@ -466,210 +671,77 @@ def repair_mask_with_mesh_paths(
         if cur_components <= 1:
             break
 
-        best: dict[str, object] | None = None
-        fallback_best: dict[str, object] | None = None
-        source_vertices = np.flatnonzero(np.isin(vertex_component, list(main_labels)))
-        if source_vertices.size == 0:
-            break
-        for candidate_label in candidate_labels:
-            target_vertices = np.flatnonzero(vertex_component == int(candidate_label))
-            path_result = None
-            if path_selection == "edge_filtered_shortest":
-                path_result = _shortest_mesh_path_min_edges(
-                    filtered_adjacency,
-                    source_vertices,
-                    target_vertices,
-                    min_edges=min_path_edges,
-                )
-            else:
-                path_result = _shortest_mesh_path(adjacency, source_vertices, target_vertices)
-
-            if path_result is None:
-                if path_selection == "edge_filtered_shortest" and edge_filter_fallback == "old_shortest":
-                    fallback_result = _shortest_mesh_path(adjacency, source_vertices, target_vertices)
-                    if fallback_result is not None:
-                        fallback_path, fallback_length = fallback_result
-                        if fallback_best is None or fallback_length < float(fallback_best["path_length_mm"]):
-                            fallback_best = {
-                                "component_label": int(candidate_label),
-                                "path": fallback_path,
-                                "path_length_mm": float(fallback_length),
-                                "filtered_path_used": False,
-                                "fallback_used": True,
-                            }
-                        continue
-                rejected += 1
-                path_metrics = {
-                    "component_label": int(candidate_label),
-                    "status": "rejected_no_mesh_path",
-                    "component_voxels": int(component_sizes[int(candidate_label)]),
-                    "anchor_count": int(anchor_counts.get(int(candidate_label), 0)),
-                }
-                if path_selection == "edge_filtered_shortest":
-                    path_metrics.update(
-                        {
-                            "path_selection": path_selection,
-                            "filtered_path_used": False,
-                            "fallback_used": False,
-                        }
-                    )
-                metrics["paths"].append(path_metrics)
-                continue
-            path, path_length = path_result
-            if best is None or path_length < float(best["path_length_mm"]):
-                best = {
-                    "component_label": int(candidate_label),
-                    "path": path,
-                    "path_length_mm": float(path_length),
-                    "filtered_path_used": path_selection == "edge_filtered_shortest",
-                    "fallback_used": False,
-                }
-
-        if best is None and fallback_best is not None:
-            best = fallback_best
-        if best is None:
+        candidate, rejections = _select_best_path(
+            adjacency,
+            filtered_adjacency,
+            vertex_component,
+            main_labels,
+            candidate_labels,
+            component_sizes,
+            anchor_counts,
+            options,
+        )
+        rejected += len(rejections)
+        metrics["paths"].extend(rejections)
+        if candidate is None:
             break
 
-        candidate_label = int(best["component_label"])
-        path = list(best["path"])
-        path_points = vertices_physical_xyz[np.asarray(path, dtype=np.int64)]
-        if path:
-            start_anchor = vertex_nearest_physical_xyz[int(path[0])]
-            end_anchor = vertex_nearest_physical_xyz[int(path[-1])]
-            extra_points = []
-            if np.all(np.isfinite(start_anchor)):
-                extra_points.append(start_anchor[None, :])
-            extra_points.append(path_points)
-            if np.all(np.isfinite(end_anchor)):
-                extra_points.append(end_anchor[None, :])
-            path_points = np.concatenate(extra_points, axis=0)
-
+        label = int(candidate.component_label)
+        path_points = _bridge_path_points(candidate.path, vertices_physical_xyz, vertex_nearest_physical_xyz)
         main_seed = np.isin(component_labels, list(main_labels))
-        candidate_seed = component_labels == candidate_label
-        main_endpoint_label = int(vertex_component[int(path[0])]) if path else 0
-        candidate_endpoint_label = int(vertex_component[int(path[-1])]) if path else 0
-        main_local_radius = float("nan")
-        candidate_local_radius = float("nan")
-        adaptive_accept_radius = float(min_accept_radius_mm)
-        if radius_mode == "adaptive_local":
-            if path and main_endpoint_label > 0:
-                main_local_radius = _local_component_radius_mm(
-                    component_labels,
-                    main_endpoint_label,
-                    vertex_nearest_physical_xyz[int(path[0])],
-                    geometry,
-                    window_mm=float(local_radius_window_mm),
-                    percentile=float(radius_percentile),
-                )
-            if path and candidate_endpoint_label > 0:
-                candidate_local_radius = _local_component_radius_mm(
-                    component_labels,
-                    candidate_endpoint_label,
-                    vertex_nearest_physical_xyz[int(path[-1])],
-                    geometry,
-                    window_mm=float(local_radius_window_mm),
-                    percentile=float(radius_percentile),
-                )
-            valid_local_radii = [
-                value for value in (main_local_radius, candidate_local_radius) if np.isfinite(value) and value > 0
-            ]
-            if valid_local_radii:
-                adaptive_accept_radius = float(np.mean(valid_local_radii) * float(radius_scale))
-            adaptive_accept_radius = float(
-                min(max(float(radius_mm), adaptive_accept_radius, float(min_accept_radius_mm)), max_radius_mm)
-            )
-        radius_values = np.arange(float(radius_mm), max_radius_mm + 0.5 * radius_step_mm, radius_step_mm)
-        extra_radius_values = [float(max_radius_mm)]
-        if radius_mode == "adaptive_local":
-            extra_radius_values.append(float(adaptive_accept_radius))
-        radius_values = np.concatenate([radius_values, np.asarray(extra_radius_values, dtype=float)])
-        radius_values = sorted(float(x) for x in np.unique(np.round(radius_values, decimals=6)) if x <= max_radius_mm)
+        candidate_seed = component_labels == label
 
-        tube = np.zeros_like(current, dtype=bool)
-        added = np.zeros_like(current, dtype=bool)
-        added_voxels = 0
-        merges = False
-        selected_radius = float(radius_mm)
-        too_many_added = False
-        for trial_radius in radius_values:
-            trial_tube = _rasterize_path_tube(
-                path_points,
+        main_local_radius, candidate_local_radius = (float("nan"), float("nan"))
+        if options.radius.adaptive:
+            main_local_radius, candidate_local_radius = _endpoint_local_radii_mm(
+                candidate.path,
+                component_labels,
+                vertex_component,
+                vertex_nearest_physical_xyz,
                 geometry,
-                float(trial_radius),
+                options,
             )
-            trial_added = trial_tube & ~current
-            trial_added_voxels = int(trial_added.sum())
-            # The bridge tube is rasterized from a continuous mesh path and is
-            # connected by construction. It merges components as soon as it
-            # touches both seeds, so avoid a full-volume connected-component
-            # relabel for every candidate radius.
-            trial_merges = bool(np.any(trial_tube & main_seed) and np.any(trial_tube & candidate_seed))
-            if trial_merges:
-                if float(trial_radius) < float(adaptive_accept_radius):
-                    continue
-                if trial_added_voxels > max_added_voxels:
-                    too_many_added = True
-                    tube = trial_tube
-                    added = trial_added
-                    added_voxels = trial_added_voxels
-                    selected_radius = float(trial_radius)
-                    break
-                tube = trial_tube
-                added = trial_added
-                added_voxels = trial_added_voxels
-                merges = True
-                selected_radius = float(trial_radius)
-                break
+        adaptive_accept_radius = options.radius.accept_radius_mm(
+            main_local_radius, candidate_local_radius
+        )
 
-        path_metrics = {
-            "component_label": int(candidate_label),
-            "component_voxels": int(component_sizes[candidate_label]),
-            "anchor_count": int(anchor_counts.get(candidate_label, 0)),
-            "path_vertices": int(len(path)),
-            "path_length_mm": float(best["path_length_mm"]),
-            "added_voxels": int(added_voxels),
-            "selected_radius_mm": float(selected_radius),
-            "radius_mode": radius_mode,
-            "adaptive_accept_radius_mm": float(adaptive_accept_radius),
-        }
-        if path_selection == "edge_filtered_shortest":
-            path_metrics.update(
-                {
-                    "path_selection": path_selection,
-                    "filtered_path_used": bool(best.get("filtered_path_used", False)),
-                    "fallback_used": bool(best.get("fallback_used", False)),
-                    **_path_edge_stats(vertices_physical_xyz, path),
-                }
-            )
-        if radius_mode == "adaptive_local":
-            path_metrics["main_local_radius_mm"] = float(main_local_radius)
-            path_metrics["candidate_local_radius_mm"] = float(candidate_local_radius)
-            path_metrics["local_radius_window_mm"] = float(local_radius_window_mm)
-            path_metrics["radius_percentile"] = float(radius_percentile)
-            path_metrics["radius_scale"] = float(radius_scale)
-        if not merges:
+        trial = grow_tube_until_merge(
+            path_points,
+            current,
+            main_seed,
+            candidate_seed,
+            geometry,
+            options.radius,
+            adaptive_accept_radius,
+            max_added_voxels,
+        )
+
+        path_metrics = _bridge_metrics(
+            candidate,
+            trial,
+            component_sizes,
+            anchor_counts,
+            vertices_physical_xyz,
+            main_local_radius,
+            candidate_local_radius,
+            adaptive_accept_radius,
+            options,
+        )
+        candidate_labels = [x for x in candidate_labels if x != label]
+
+        if not trial.merges:
             rejected += 1
             path_metrics["status"] = (
-                "rejected_too_many_added_voxels" if too_many_added else "rejected_did_not_merge"
+                "rejected_too_many_added_voxels" if trial.too_many_added else "rejected_did_not_merge"
             )
-            if too_many_added:
+            if trial.too_many_added:
                 path_metrics["max_added_voxels"] = int(max_added_voxels)
             metrics["paths"].append(path_metrics)
-            candidate_labels = [x for x in candidate_labels if x != candidate_label]
-            continue
-        if added_voxels > max_added_voxels:
-            rejected += 1
-            path_metrics["status"] = "rejected_too_many_added_voxels"
-            path_metrics["max_added_voxels"] = int(max_added_voxels)
-            metrics["paths"].append(path_metrics)
-            candidate_labels = [x for x in candidate_labels if x != candidate_label]
             continue
 
-        test = current | tube
-        current = test
-        bridge_mask |= added
-        main_labels.add(candidate_label)
-        candidate_labels = [x for x in candidate_labels if x != candidate_label]
+        current = current | trial.tube
+        bridge_mask |= trial.added
+        main_labels.add(label)
         accepted += 1
         path_metrics["status"] = "accepted"
         metrics["paths"].append(path_metrics)
@@ -680,14 +752,7 @@ def repair_mask_with_mesh_paths(
     metrics["repaired_components"] = int(repaired_components)
     metrics["added_voxels"] = int((current & ~original).sum())
     if accepted == 0:
-        metrics["repair_status"] = "noop_no_valid_bridge"
-    elif repaired_components <= 1:
-        metrics["repair_status"] = "connected"
-    else:
-        metrics["repair_status"] = "partial_connected"
-    return MeshPathRepairResult(
-        repaired=current,
-        bridge_mask=bridge_mask,
-        component_labels=component_labels,
-        metrics=metrics,
-    )
+        return finished("noop_no_valid_bridge")
+    if repaired_components <= 1:
+        return finished("connected")
+    return finished("partial_connected")

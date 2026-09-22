@@ -102,3 +102,38 @@ def test_repair_metrics_are_unchanged(case, replayed):
         "added_voxels",
     ]
     assert {k: produced[k] for k in watched} == {k: expected[k] for k in watched}
+
+
+@pytest.mark.parametrize("case", CASES, ids=_case_id)
+def test_per_bridge_decisions_are_unchanged(case, replayed):
+    """Every bridge's own record must match: which component, what radius, accepted or why not.
+
+    The summary counts above would survive a change that swapped one accepted bridge
+    for another. This compares the decisions themselves.
+    """
+    section = "mesh_path_repair" if case.method == "mesh_path_connect" else "endpoint_repair"
+    produced = json.loads((replayed[_case_id(case)] / "metrics.json").read_text())[section]
+
+    assert _comparable(produced) == _comparable(case.metrics[section])
+
+
+@pytest.mark.parametrize("case", CASES, ids=_case_id)
+def test_cleanup_metrics_are_unchanged(case, replayed):
+    """The mesh-supported cleanup must remove exactly the same components."""
+    expected = case.metrics.get("post_repair_cleanup")
+    if expected is None:
+        pytest.skip("this run had no post-repair cleanup")
+    produced = json.loads((replayed[_case_id(case)] / "metrics.json").read_text())["post_repair_cleanup"]
+
+    assert _comparable(produced) == _comparable(expected)
+
+
+def _comparable(value):
+    """Round floats so a last-bit difference in a reported distance is not a failure."""
+    if isinstance(value, dict):
+        return {k: _comparable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_comparable(v) for v in value]
+    if isinstance(value, float):
+        return round(value, 6)
+    return value

@@ -6,13 +6,17 @@ import numpy as np
 from scipy import ndimage
 from scipy.spatial import cKDTree
 
+from .bridge_tube import (
+    RadiusPolicy,
+    TubeTrial,
+    grow_tube_until_merge,
+    local_component_radius_mm,
+)
 from .io_utils import ImageGeometry
 from .mesh_path_repair import (
     MeshPathRepairResult,
     _component_sizes,
     _connectivity_structure,
-    _local_component_radius_mm,
-    _rasterize_path_tube,
 )
 
 
@@ -281,6 +285,160 @@ def _find_best_endpoint_candidate(
     return None, rejections
 
 
+@dataclass(frozen=True)
+class _EndpointOptions:
+    """Validated settings for endpoint bridge repair.
+
+    How wide a bridge may be is delegated to :class:`RadiusPolicy`, shared with the
+    mesh-graph strategy. The fields here govern which endpoint pairs are even
+    considered and how much mesh evidence a straight bridge needs.
+    """
+
+    max_gap_mm: float
+    mesh_support_mm: float
+    min_mesh_support_fraction: float
+    radius: RadiusPolicy
+    min_component_voxels: int
+    max_added_fraction: float
+    connectivity: int
+
+
+def _resolve_endpoint_options(
+    geometry: ImageGeometry,
+    *,
+    max_gap_mm: float,
+    mesh_support_mm: float,
+    min_mesh_support_fraction: float,
+    radius_mm: float,
+    max_radius_mm: float | None,
+    min_accept_radius_mm: float | None,
+    radius_mode: str,
+    local_radius_window_mm: float,
+    radius_percentile: float,
+    radius_scale: float,
+    min_component_voxels: int,
+    max_added_fraction: float,
+    connectivity: int,
+) -> _EndpointOptions:
+    """Check the option values and settle the radius bounds."""
+    # With no explicit cap, a bridge may grow as wide as the largest gap this run is
+    # willing to cross.
+    auto_max_radius_mm = max(float(radius_mm), float(max_gap_mm))
+    policy = RadiusPolicy.resolve(
+        geometry,
+        radius_mm=radius_mm,
+        max_radius_mm=max_radius_mm,
+        auto_max_radius_mm=auto_max_radius_mm,
+        min_accept_radius_mm=min_accept_radius_mm,
+        mode=radius_mode,
+        local_window_mm=local_radius_window_mm,
+        percentile=radius_percentile,
+        scale=radius_scale,
+    )
+    return _EndpointOptions(
+        max_gap_mm=float(max_gap_mm),
+        mesh_support_mm=float(mesh_support_mm),
+        min_mesh_support_fraction=float(min_mesh_support_fraction),
+        radius=policy,
+        min_component_voxels=int(min_component_voxels),
+        max_added_fraction=float(max_added_fraction),
+        connectivity=int(connectivity),
+    )
+
+
+def _initial_endpoint_metrics(
+    options: _EndpointOptions,
+    original_components: int,
+    max_added_voxels: int,
+) -> dict[str, object]:
+    """The metrics record, pre-filled with the settings the run used."""
+    return {
+        "repair_status": "",
+        "original_components": int(original_components),
+        "repaired_components": int(original_components),
+        "accepted_paths": 0,
+        "rejected_paths": 0,
+        "added_voxels": 0,
+        "max_added_voxels": int(max_added_voxels),
+        "max_gap_mm": options.max_gap_mm,
+        "mesh_support_mm": options.mesh_support_mm,
+        "min_mesh_support_fraction": options.min_mesh_support_fraction,
+        "radius_mm": options.radius.radius_mm,
+        "max_radius_mm": options.radius.max_radius_mm,
+        "min_accept_radius_mm": options.radius.min_accept_radius_mm,
+        "radius_mode": options.radius.mode,
+        "local_radius_window_mm": options.radius.local_window_mm,
+        "radius_percentile": options.radius.percentile,
+        "radius_scale": options.radius.scale,
+        "min_component_voxels": options.min_component_voxels,
+        "max_added_fraction": options.max_added_fraction,
+        "connectivity": options.connectivity,
+        "paths": [],
+    }
+
+
+def _endpoint_local_radii_mm(
+    best: _EndpointCandidate,
+    component_labels: np.ndarray,
+    geometry: ImageGeometry,
+    options: _EndpointOptions,
+) -> tuple[float, float]:
+    """Local vessel calibre of the mask at each end of the proposed bridge."""
+    main_label = int(component_labels[tuple(best.main_voxel_zyx)])
+    candidate_label = int(component_labels[tuple(best.candidate_voxel_zyx)])
+    main_radius = float("nan")
+    candidate_radius = float("nan")
+    if main_label > 0:
+        main_radius = local_component_radius_mm(
+            component_labels,
+            main_label,
+            best.main_point_xyz,
+            geometry,
+            window_mm=options.radius.local_window_mm,
+            percentile=options.radius.percentile,
+        )
+    if candidate_label > 0:
+        candidate_radius = local_component_radius_mm(
+            component_labels,
+            candidate_label,
+            best.candidate_point_xyz,
+            geometry,
+            window_mm=options.radius.local_window_mm,
+            percentile=options.radius.percentile,
+        )
+    return main_radius, candidate_radius
+
+
+def _endpoint_bridge_metrics(
+    best: _EndpointCandidate,
+    trial: TubeTrial,
+    component_sizes: np.ndarray,
+    main_local_radius: float,
+    candidate_local_radius: float,
+    adaptive_accept_radius: float,
+    options: _EndpointOptions,
+) -> dict[str, object]:
+    """One bridge's record: the gap it crossed, its mesh support, and what it cost."""
+    label = int(best.component_label)
+    metrics: dict[str, object] = {
+        "component_label": label,
+        "component_voxels": int(component_sizes[label]),
+        "endpoint_distance_mm": float(best.endpoint_distance_mm),
+        "mesh_support_fraction": float(best.mesh_support_fraction),
+        "mesh_support_min_mm": float(best.mesh_support_min_mm),
+        "mesh_support_median_mm": float(best.mesh_support_median_mm),
+        "mesh_support_max_mm": float(best.mesh_support_max_mm),
+        "added_voxels": int(trial.added_voxels),
+        "selected_radius_mm": float(trial.selected_radius_mm),
+        "radius_mode": options.radius.mode,
+        "adaptive_accept_radius_mm": float(adaptive_accept_radius),
+    }
+    if options.radius.adaptive:
+        metrics["main_local_radius_mm"] = float(main_local_radius)
+        metrics["candidate_local_radius_mm"] = float(candidate_local_radius)
+    return metrics
+
+
 def repair_mask_with_endpoint_paths(
     original_mask_zyx: np.ndarray,
     vertices_physical_xyz: np.ndarray,
@@ -301,83 +459,71 @@ def repair_mask_with_endpoint_paths(
     max_added_fraction: float = 0.03,
     connectivity: int = 26,
 ) -> MeshPathRepairResult:
-    """Conservatively bridge nearest mask endpoints with mesh support validation.
+    """Reconnect a fragmented mask with short straight bridges the mesh vouches for.
 
-    Unlike ``mesh_path_connect``, this does not follow mesh graph edges. It
-    chooses the closest endpoint-to-endpoint gap between connected components in
-    the mask, then checks that the straight local bridge is supported by nearby
-    fitted-mesh vertices/face centroids.
+    Unlike the mesh-graph strategy this does not follow mesh edges. It takes the
+    closest endpoint-to-endpoint gap between components and checks that the straight
+    line across it runs close to the fitted mesh, so the mesh validates a bridge
+    rather than proposing one. That suits dense branching trees such as the pulmonary
+    arteries, where graph paths across a 20k-vertex mesh are long and unreliable.
+
+    A proposal is rasterised as a thin tube and kept only if it truly merges the two
+    components within the foreground-growth budget.
     """
     original = original_mask_zyx.astype(bool, copy=False)
-    radius_mode = str(radius_mode).strip().lower()
-    if radius_mode not in {"fixed", "adaptive_local"}:
-        raise ValueError("radius_mode must be one of: fixed, adaptive_local")
+    options = _resolve_endpoint_options(
+        geometry,
+        max_gap_mm=max_gap_mm,
+        mesh_support_mm=mesh_support_mm,
+        min_mesh_support_fraction=min_mesh_support_fraction,
+        radius_mm=radius_mm,
+        max_radius_mm=max_radius_mm,
+        min_accept_radius_mm=min_accept_radius_mm,
+        radius_mode=radius_mode,
+        local_radius_window_mm=local_radius_window_mm,
+        radius_percentile=radius_percentile,
+        radius_scale=radius_scale,
+        min_component_voxels=min_component_voxels,
+        max_added_fraction=max_added_fraction,
+        connectivity=connectivity,
+    )
 
-    structure = _connectivity_structure(connectivity)
+    structure = _connectivity_structure(options.connectivity)
     component_labels, original_components = ndimage.label(original, structure=structure)
     component_labels = component_labels.astype(np.int32, copy=False)
     component_sizes = _component_sizes(component_labels, original_components)
     original_voxels = int(original.sum())
-    max_added_voxels = int(max(1, np.floor(float(max_added_fraction) * max(original_voxels, 1))))
-    spacing_zyx = np.asarray([geometry.spacing_xyz[2], geometry.spacing_xyz[1], geometry.spacing_xyz[0]], dtype=float)
-    radius_step_mm = float(max(np.min(spacing_zyx), 1e-6))
-    if max_radius_mm is None or float(max_radius_mm) <= 0:
-        max_radius_mm = max(float(radius_mm), float(max_gap_mm))
-    max_radius_mm = float(max(float(radius_mm), float(max_radius_mm)))
-    if min_accept_radius_mm is None or float(min_accept_radius_mm) <= 0:
-        min_accept_radius_mm = float(radius_mm)
-    min_accept_radius_mm = float(min(max(float(radius_mm), float(min_accept_radius_mm)), max_radius_mm))
+    max_added_voxels = int(max(1, np.floor(options.max_added_fraction * max(original_voxels, 1))))
 
     current = original.copy()
     bridge_mask = np.zeros_like(original, dtype=bool)
-    metrics: dict[str, object] = {
-        "repair_status": "",
-        "original_components": int(original_components),
-        "repaired_components": int(original_components),
-        "accepted_paths": 0,
-        "rejected_paths": 0,
-        "added_voxels": 0,
-        "max_added_voxels": int(max_added_voxels),
-        "max_gap_mm": float(max_gap_mm),
-        "mesh_support_mm": float(mesh_support_mm),
-        "min_mesh_support_fraction": float(min_mesh_support_fraction),
-        "radius_mm": float(radius_mm),
-        "max_radius_mm": float(max_radius_mm),
-        "min_accept_radius_mm": float(min_accept_radius_mm),
-        "radius_mode": radius_mode,
-        "local_radius_window_mm": float(local_radius_window_mm),
-        "radius_percentile": float(radius_percentile),
-        "radius_scale": float(radius_scale),
-        "min_component_voxels": int(min_component_voxels),
-        "max_added_fraction": float(max_added_fraction),
-        "connectivity": int(connectivity),
-        "paths": [],
-    }
+    metrics = _initial_endpoint_metrics(options, original_components, max_added_voxels)
+
+    def finished(status: str) -> MeshPathRepairResult:
+        metrics["repair_status"] = status
+        return MeshPathRepairResult(current, bridge_mask, component_labels, metrics)
+
     if original_components <= 1:
-        metrics["repair_status"] = "noop_already_connected"
-        return MeshPathRepairResult(current, bridge_mask, component_labels, metrics)
+        return finished("noop_already_connected")
     if original_voxels <= 0:
-        metrics["repair_status"] = "noop_empty_mask"
-        return MeshPathRepairResult(current, bridge_mask, component_labels, metrics)
+        return finished("noop_empty_mask")
 
     support_points = _mesh_support_points(vertices_physical_xyz, faces)
     if support_points.size == 0:
-        metrics["repair_status"] = "noop_empty_mesh_support"
-        return MeshPathRepairResult(current, bridge_mask, component_labels, metrics)
+        return finished("noop_empty_mesh_support")
     support_tree = cKDTree(support_points)
     metrics["support_points"] = int(support_points.shape[0])
 
     component_order = [
         int(label)
         for label in np.argsort(component_sizes[1:])[::-1] + 1
-        if component_sizes[int(label)] >= int(min_component_voxels)
+        if component_sizes[int(label)] >= options.min_component_voxels
     ]
     if not component_order:
-        metrics["repair_status"] = "noop_no_large_components"
-        return MeshPathRepairResult(current, bridge_mask, component_labels, metrics)
+        return finished("noop_no_large_components")
 
     main_labels = {int(component_order[0])}
-    candidate_labels = [label for label in component_order[1:]]
+    candidate_labels = list(component_order[1:])
     metrics["main_component_label"] = int(component_order[0])
     metrics["candidate_component_labels"] = [int(x) for x in candidate_labels]
 
@@ -395,6 +541,7 @@ def repair_mask_with_endpoint_paths(
         _, cur_components = ndimage.label(current, structure=structure)
         if cur_components <= 1:
             break
+
         best, rejections = _find_best_endpoint_candidate(
             component_labels,
             component_sizes,
@@ -405,115 +552,68 @@ def repair_mask_with_endpoint_paths(
             support_tree,
             surface_voxels_by_label,
             surface_points_by_label,
-            max_gap_mm=float(max_gap_mm),
-            mesh_support_mm=float(mesh_support_mm),
-            min_mesh_support_fraction=float(min_mesh_support_fraction),
+            max_gap_mm=options.max_gap_mm,
+            mesh_support_mm=options.mesh_support_mm,
+            min_mesh_support_fraction=options.min_mesh_support_fraction,
         )
         if best is None:
             rejected += len(rejections)
             metrics["paths"].extend(rejections)
             break
 
-        candidate_label = int(best.component_label)
-        path_points = np.stack([best.main_point_xyz, best.candidate_point_xyz], axis=0).astype(np.float32, copy=False)
+        label = int(best.component_label)
+        path_points = np.stack(
+            [best.main_point_xyz, best.candidate_point_xyz], axis=0
+        ).astype(np.float32, copy=False)
+        # Bridges accepted earlier count as part of the main component, so a later
+        # bridge may legitimately land on one of them.
         main_seed = np.isin(component_labels, list(main_labels)) | bridge_mask
-        candidate_seed = component_labels == candidate_label
+        candidate_seed = component_labels == label
 
-        main_endpoint_label = int(component_labels[tuple(best.main_voxel_zyx)])
-        candidate_endpoint_label = int(component_labels[tuple(best.candidate_voxel_zyx)])
-        main_local_radius = float("nan")
-        candidate_local_radius = float("nan")
-        adaptive_accept_radius = float(min_accept_radius_mm)
-        if radius_mode == "adaptive_local":
-            if main_endpoint_label > 0:
-                main_local_radius = _local_component_radius_mm(
-                    component_labels,
-                    main_endpoint_label,
-                    best.main_point_xyz,
-                    geometry,
-                    window_mm=float(local_radius_window_mm),
-                    percentile=float(radius_percentile),
-                )
-            if candidate_endpoint_label > 0:
-                candidate_local_radius = _local_component_radius_mm(
-                    component_labels,
-                    candidate_endpoint_label,
-                    best.candidate_point_xyz,
-                    geometry,
-                    window_mm=float(local_radius_window_mm),
-                    percentile=float(radius_percentile),
-                )
-            valid_radii = [value for value in (main_local_radius, candidate_local_radius) if np.isfinite(value) and value > 0]
-            if valid_radii:
-                adaptive_accept_radius = float(np.mean(valid_radii) * float(radius_scale))
-            adaptive_accept_radius = float(
-                min(max(float(radius_mm), adaptive_accept_radius, float(min_accept_radius_mm)), max_radius_mm)
+        main_local_radius, candidate_local_radius = (float("nan"), float("nan"))
+        if options.radius.adaptive:
+            main_local_radius, candidate_local_radius = _endpoint_local_radii_mm(
+                best, component_labels, geometry, options
             )
+        adaptive_accept_radius = options.radius.accept_radius_mm(
+            main_local_radius, candidate_local_radius
+        )
 
-        radius_values = np.arange(float(radius_mm), max_radius_mm + 0.5 * radius_step_mm, radius_step_mm)
-        extra_radius_values = [float(max_radius_mm)]
-        if radius_mode == "adaptive_local":
-            extra_radius_values.append(float(adaptive_accept_radius))
-        radius_values = np.concatenate([radius_values, np.asarray(extra_radius_values, dtype=float)])
-        radius_values = sorted(float(x) for x in np.unique(np.round(radius_values, decimals=6)) if x <= max_radius_mm)
+        trial = grow_tube_until_merge(
+            path_points,
+            current,
+            main_seed,
+            candidate_seed,
+            geometry,
+            options.radius,
+            adaptive_accept_radius,
+            max_added_voxels,
+        )
 
-        tube = np.zeros_like(current, dtype=bool)
-        added = np.zeros_like(current, dtype=bool)
-        added_voxels = 0
-        selected_radius = float(radius_mm)
-        merges = False
-        too_many_added = False
-        for trial_radius in radius_values:
-            trial_tube = _rasterize_path_tube(path_points, geometry, float(trial_radius))
-            trial_added = trial_tube & ~current
-            trial_added_voxels = int(trial_added.sum())
-            trial_merges = bool(np.any(trial_tube & main_seed) and np.any(trial_tube & candidate_seed))
-            if trial_merges:
-                if float(trial_radius) < float(adaptive_accept_radius):
-                    continue
-                if trial_added_voxels > max_added_voxels:
-                    too_many_added = True
-                    tube = trial_tube
-                    added = trial_added
-                    added_voxels = trial_added_voxels
-                    selected_radius = float(trial_radius)
-                    break
-                tube = trial_tube
-                added = trial_added
-                added_voxels = trial_added_voxels
-                selected_radius = float(trial_radius)
-                merges = True
-                break
+        path_metrics = _endpoint_bridge_metrics(
+            best,
+            trial,
+            component_sizes,
+            main_local_radius,
+            candidate_local_radius,
+            adaptive_accept_radius,
+            options,
+        )
+        candidate_labels = [x for x in candidate_labels if x != label]
 
-        path_metrics = {
-            "component_label": int(candidate_label),
-            "component_voxels": int(component_sizes[candidate_label]),
-            "endpoint_distance_mm": float(best.endpoint_distance_mm),
-            "mesh_support_fraction": float(best.mesh_support_fraction),
-            "mesh_support_min_mm": float(best.mesh_support_min_mm),
-            "mesh_support_median_mm": float(best.mesh_support_median_mm),
-            "mesh_support_max_mm": float(best.mesh_support_max_mm),
-            "added_voxels": int(added_voxels),
-            "selected_radius_mm": float(selected_radius),
-            "radius_mode": radius_mode,
-            "adaptive_accept_radius_mm": float(adaptive_accept_radius),
-        }
-        if radius_mode == "adaptive_local":
-            path_metrics["main_local_radius_mm"] = float(main_local_radius)
-            path_metrics["candidate_local_radius_mm"] = float(candidate_local_radius)
-        if not merges:
+        if not trial.merges:
             rejected += 1
-            path_metrics["status"] = "rejected_too_many_added_voxels" if too_many_added else "rejected_did_not_merge"
-            if too_many_added:
+            path_metrics["status"] = (
+                "rejected_too_many_added_voxels" if trial.too_many_added else "rejected_did_not_merge"
+            )
+            if trial.too_many_added:
                 path_metrics["max_added_voxels"] = int(max_added_voxels)
             metrics["paths"].append(path_metrics)
-            candidate_labels = [x for x in candidate_labels if x != candidate_label]
             continue
 
-        current |= tube
-        bridge_mask |= added
-        main_labels.add(candidate_label)
-        candidate_labels = [x for x in candidate_labels if x != candidate_label]
+        current |= trial.tube
+        bridge_mask |= trial.added
+        main_labels.add(label)
         accepted += 1
         path_metrics["status"] = "accepted"
         metrics["paths"].append(path_metrics)
@@ -524,9 +624,7 @@ def repair_mask_with_endpoint_paths(
     metrics["repaired_components"] = int(repaired_components)
     metrics["added_voxels"] = int((current & ~original).sum())
     if accepted == 0:
-        metrics["repair_status"] = "noop_no_valid_bridge"
-    elif repaired_components <= 1:
-        metrics["repair_status"] = "connected"
-    else:
-        metrics["repair_status"] = "partial_connected"
-    return MeshPathRepairResult(current, bridge_mask, component_labels, metrics)
+        return finished("noop_no_valid_bridge")
+    if repaired_components <= 1:
+        return finished("connected")
+    return finished("partial_connected")
