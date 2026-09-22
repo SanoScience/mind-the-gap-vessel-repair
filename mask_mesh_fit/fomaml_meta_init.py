@@ -22,9 +22,6 @@ from .optimize import (
 )
 from .reptile_meta_init import (
     ALLOWED_PREFIXES,
-    TOPCOW_MASK_DIR,
-    TOPCOW_SOLVED_STATE_GLOB,
-    TOPCOW_TEMPLATE,
     average_states,
     checkpoint_decoder_config,
     discover_cases,
@@ -35,9 +32,6 @@ from .reptile_meta_init import (
 )
 
 
-TOPCOW_FOMAML_OUTPUT_DIR = Path(
-    "/home/gniewosz/segmentation/frameworks/v24/runs/TopCow/FOMAML_meta_init_torus10k"
-)
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,10 +42,10 @@ def parse_args() -> argparse.Namespace:
             "the adapted query loss gradient."
         )
     )
-    parser.add_argument("--mask-dir", type=Path, default=TOPCOW_MASK_DIR)
-    parser.add_argument("--template", type=Path, default=TOPCOW_TEMPLATE)
-    parser.add_argument("--solved-state-glob", default=TOPCOW_SOLVED_STATE_GLOB)
-    parser.add_argument("--output-dir", type=Path, default=TOPCOW_FOMAML_OUTPUT_DIR)
+    parser.add_argument("--mask-dir", type=Path, required=True)
+    parser.add_argument("--template", type=Path, required=True)
+    parser.add_argument("--solved-state-glob", required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--train-count", type=int, default=100)
     parser.add_argument("--val-count", type=int, default=25)
     parser.add_argument(

@@ -13,20 +13,6 @@ import torch
 
 
 ALLOWED_PREFIXES = ("decoder.", "latent0", "local_features.")
-TOPCOW_MASK_DIR = Path(
-    "/home/gniewosz/segmentation/baseline/helios/nnunet/results/"
-    "Dataset003_TOPCOW_CT_BINARY/nnUNetTrainer__nnUNetPlans__3d_fullres/oof_predictions"
-)
-TOPCOW_TEMPLATE = Path(
-    "/home/gniewosz/segmentation/Voxel_Mesh/mesh_gt/topcow_torus_template_10k_thin_stagefixed.npz"
-)
-TOPCOW_SOLVED_STATE_GLOB = (
-    "/home/gniewosz/segmentation/frameworks/v24/runs/TopCow/Oof_torus10k/"
-    "*_voxelrepair_torus10k/mesh_fit_state.pt"
-)
-TOPCOW_OUTPUT_DIR = Path(
-    "/home/gniewosz/segmentation/frameworks/v24/runs/TopCow/Reptile_meta_init_torus10k"
-)
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,10 +22,10 @@ def parse_args() -> argparse.Namespace:
             "meta-updates over short fit_case adaptations."
         )
     )
-    parser.add_argument("--mask-dir", type=Path, default=TOPCOW_MASK_DIR)
-    parser.add_argument("--template", type=Path, default=TOPCOW_TEMPLATE)
-    parser.add_argument("--solved-state-glob", default=TOPCOW_SOLVED_STATE_GLOB)
-    parser.add_argument("--output-dir", type=Path, default=TOPCOW_OUTPUT_DIR)
+    parser.add_argument("--mask-dir", type=Path, required=True)
+    parser.add_argument("--template", type=Path, required=True)
+    parser.add_argument("--solved-state-glob", required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--train-count", type=int, default=100)
     parser.add_argument("--val-count", type=int, default=25)
     parser.add_argument("--max-train-cases", type=int, default=0)

@@ -18,7 +18,6 @@ except ImportError:  # pragma: no cover - old torch fallback
 from .losses import MeshTensors
 from .optimize import _FourStageDecoderFitModule, _weighted_deform_loss
 from .fomaml_meta_init import (
-    TOPCOW_FOMAML_OUTPUT_DIR,
     build_module,
     load_meta_into_module,
     load_target_norm,
@@ -26,9 +25,6 @@ from .fomaml_meta_init import (
 )
 from .reptile_meta_init import (
     ALLOWED_PREFIXES,
-    TOPCOW_MASK_DIR,
-    TOPCOW_SOLVED_STATE_GLOB,
-    TOPCOW_TEMPLATE,
     average_states,
     checkpoint_decoder_config,
     discover_cases,
@@ -39,7 +35,6 @@ from .reptile_meta_init import (
 )
 
 
-TOPCOW_MAML_OUTPUT_DIR = TOPCOW_FOMAML_OUTPUT_DIR.parent / "MAML_meta_init_torus10k_smoke"
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,10 +45,10 @@ def parse_args() -> argparse.Namespace:
             "large inner-step counts are very memory intensive."
         )
     )
-    parser.add_argument("--mask-dir", type=Path, default=TOPCOW_MASK_DIR)
-    parser.add_argument("--template", type=Path, default=TOPCOW_TEMPLATE)
-    parser.add_argument("--solved-state-glob", default=TOPCOW_SOLVED_STATE_GLOB)
-    parser.add_argument("--output-dir", type=Path, default=TOPCOW_MAML_OUTPUT_DIR)
+    parser.add_argument("--mask-dir", type=Path, required=True)
+    parser.add_argument("--template", type=Path, required=True)
+    parser.add_argument("--solved-state-glob", required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--train-count", type=int, default=100)
     parser.add_argument("--val-count", type=int, default=25)
     parser.add_argument("--max-train-cases", type=int, default=5)

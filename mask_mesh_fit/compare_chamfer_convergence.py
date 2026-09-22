@@ -11,26 +11,14 @@ import numpy as np
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 
-DEFAULT_CASE_LIST = Path(
-    "/home/gniewosz/segmentation/frameworks/v24/runs/TopCow/"
-    "Reptile_meta_init_torus10k/meta_val_cases.txt"
-)
-DEFAULT_BASELINE_ROOT = Path("/home/gniewosz/segmentation/frameworks/v24/runs/TopCow/Oof_torus10k")
-DEFAULT_REPTILE_ROOT = Path(
-    "/home/gniewosz/segmentation/frameworks/v24/runs/TopCow/Convergence_reptile500"
-)
-DEFAULT_OUT_DIR = Path(
-    "/home/gniewosz/segmentation/frameworks/v24/runs/TopCow/"
-    "Convergence_compare_reptile500"
-)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare TOPCOW mesh Chamfer convergence curves.")
-    parser.add_argument("--case-list", type=Path, default=DEFAULT_CASE_LIST)
-    parser.add_argument("--baseline-root", type=Path, default=DEFAULT_BASELINE_ROOT)
-    parser.add_argument("--reptile-root", type=Path, default=DEFAULT_REPTILE_ROOT)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUT_DIR)
+    parser.add_argument("--case-list", type=Path, required=True)
+    parser.add_argument("--baseline-root", type=Path, required=True)
+    parser.add_argument("--reptile-root", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--baseline-label", default="onecase_init_6000_first500")
     parser.add_argument("--reptile-label", default="reptile_500")
     parser.add_argument("--scalar-tag", default="mesh/final_chamfer")
