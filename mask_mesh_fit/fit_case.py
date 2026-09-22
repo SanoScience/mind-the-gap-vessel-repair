@@ -11,8 +11,6 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from .artifact_filter import filter_mask_artifacts_by_component_distance
-from .endpoint_repair import repair_mask_with_endpoint_paths
 from .geometry import load_template
 from .io_utils import (
     extract_surface_from_mask,
@@ -23,10 +21,11 @@ from .io_utils import (
     save_mask_like,
     save_npz,
 )
-from .mesh_path_repair import repair_mask_with_mesh_paths
 from .optimize import DecoderConfig, StageConfig, fit_mesh_to_target
 from .post_repair_cleanup import remove_mesh_uncovered_components
 from .qa import save_qa_overlay
+from .repair_args import add_case_arguments, add_repair_arguments
+from .repair_pipeline import BRIDGE_METHODS, filter_artifacts, growth_metrics, run_bridge_repair
 from .voxelize import (
     mesh_signed_distance,
     repair_mask_with_component_gated_sdf,
@@ -70,10 +69,8 @@ def _find_mask(mask_dir: Path, case_id: str) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fit a sphere-topology mesh to one nnUNet predicted mask.")
-    parser.add_argument("--case-id", required=True)
-    parser.add_argument("--mask-dir", type=Path, required=True)
+    add_case_arguments(parser)
     parser.add_argument("--template", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
 
@@ -139,110 +136,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--detail-lambda-face-area", type=float, default=0.0)
     parser.add_argument("--detail-lambda-face-area-var", type=float, default=0.0005)
 
-    parser.add_argument("--mask-artifact-filter", choices=["none", "component_distance"], default="none")
-    parser.add_argument("--artifact-keep-near-main-mm", type=float, default=12.0)
-    parser.add_argument("--artifact-remove-distance-mm", type=float, default=25.0)
-    parser.add_argument(
-        "--artifact-max-remove-voxels",
-        type=int,
-        default=50,
-        help="Maximum size of far components to remove. Use 0 to remove all far components by distance only.",
-    )
-    parser.add_argument("--artifact-connectivity", type=int, choices=[6, 18, 26], default=26)
-    parser.add_argument("--repair-dilation-mm", type=float, default=8.0)
-    parser.add_argument("--repair-region-method", choices=["edt_crop", "edt", "binary_dilation"], default="edt_crop")
-    parser.add_argument(
-        "--geometric-repair-method",
-        choices=["voxel_or", "sdf_cc", "component_sdf", "both", "mesh_path_connect", "mask_endpoint_connect"],
-        default="voxel_or",
-    )
-    parser.add_argument("--sdf-repair-threshold-mm", type=float, default=1.5)
-    parser.add_argument("--sdf-repair-connectivity", type=int, choices=[6, 18, 26], default=26)
-    parser.add_argument(
-        "--component-sdf-touch-original-mask",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
     parser.add_argument("--repair-mode", choices=["voxelize", "learned", "both"], default="voxelize")
     parser.add_argument("--learned-refiner-checkpoint", type=Path, default=None)
-    parser.add_argument("--sdf-clip-mm", type=float, default=16.0)
-    parser.add_argument("--save-mesh-sdf", action="store_true")
-    parser.add_argument("--voxelize-backend", choices=["pyvista", "multigeomed"], default="pyvista")
-    parser.add_argument("--voxelize-margin-voxels", type=int, default=3)
-    parser.add_argument("--voxelize-slab-depth", type=int, default=16)
     parser.add_argument("--skip-voxelize", action="store_true")
-    parser.add_argument("--path-repair-anchor-mm", type=float, default=2.0)
-    parser.add_argument("--path-repair-radius-mm", type=float, default=1.0)
-    parser.add_argument(
-        "--path-repair-max-radius-mm",
-        type=float,
-        default=0.0,
-        help="Maximum bridge tube radius. Use 0 for auto: anchor_mm plus one voxel.",
-    )
-    parser.add_argument(
-        "--path-repair-min-accept-radius-mm",
-        type=float,
-        default=0.0,
-        help="Keep growing an accepted bridge until at least this radius. Use 0 to accept at path-repair-radius-mm.",
-    )
-    parser.add_argument(
-        "--path-repair-radius-mode",
-        choices=["fixed", "adaptive_local"],
-        default="fixed",
-        help="Use a fixed bridge radius or adapt it from local component thickness.",
-    )
-    parser.add_argument("--path-repair-local-radius-window-mm", type=float, default=6.0)
-    parser.add_argument("--path-repair-radius-percentile", type=float, default=80.0)
-    parser.add_argument("--path-repair-radius-scale", type=float, default=1.0)
-    parser.add_argument("--path-repair-min-component-voxels", type=int, default=20)
-    parser.add_argument("--path-repair-max-added-fraction", type=float, default=0.03)
-    parser.add_argument("--path-repair-connectivity", type=int, choices=[6, 18, 26], default=26)
-    parser.add_argument(
-        "--path-repair-selection",
-        choices=["shortest", "edge_filtered_shortest"],
-        default="shortest",
-        help="Bridge selector. shortest preserves the original behavior.",
-    )
-    parser.add_argument("--path-repair-min-path-edges", type=int, default=2)
-    parser.add_argument(
-        "--path-repair-max-mesh-edge-mm",
-        type=float,
-        default=0.0,
-        help="For edge_filtered_shortest, ignore mesh graph edges longer than this. Use 0 to disable edge cap.",
-    )
-    parser.add_argument(
-        "--path-repair-edge-filter-fallback",
-        choices=["old_shortest", "skip"],
-        default="old_shortest",
-        help="What to do if edge-filtered selection finds no valid bridge.",
-    )
-    parser.add_argument(
-        "--endpoint-repair-max-gap-mm",
-        type=float,
-        default=12.0,
-        help="For mask_endpoint_connect, only bridge component endpoints this close in physical space.",
-    )
-    parser.add_argument(
-        "--endpoint-repair-mesh-support-mm",
-        type=float,
-        default=3.0,
-        help="For mask_endpoint_connect, line samples must be this close to fitted mesh support.",
-    )
-    parser.add_argument(
-        "--endpoint-repair-min-mesh-support-fraction",
-        type=float,
-        default=0.50,
-        help="For mask_endpoint_connect, minimum fraction of line samples close to mesh support.",
-    )
-    parser.add_argument(
-        "--post-repair-cleanup",
-        choices=["none", "remove_mesh_uncovered_components"],
-        default="none",
-    )
-    parser.add_argument("--post-cleanup-mesh-distance-mm", type=float, default=2.0)
-    parser.add_argument("--post-cleanup-min-close-fraction", type=float, default=0.01)
-    parser.add_argument("--post-cleanup-max-remove-voxels", type=int, default=1000)
-    parser.add_argument("--post-cleanup-connectivity", type=int, choices=[6, 18, 26], default=26)
     parser.add_argument(
         "--init-fit-state",
         type=Path,
@@ -262,8 +158,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--disable-save-fit-state", action="store_true")
     parser.add_argument("--disable-tensorboard", action="store_true")
-    parser.add_argument("--disable-qa", action="store_true")
     parser.add_argument("--tensorboard-dir", type=Path, default=None)
+    add_repair_arguments(
+        parser,
+        geometric_repair_method="voxel_or",
+        sdf_repair_threshold_mm=1.5,
+        voxelize_backend="pyvista",
+    )
     return parser.parse_args()
 
 
@@ -313,31 +214,11 @@ def main() -> None:
             writer.add_scalar(f"{stage}/{name}", scalar, global_step=step)
 
     mask_zyx, reference_image, geometry = load_mask(mask_path)
-    artifact_filter_metrics = None
-    if args.mask_artifact_filter == "component_distance":
-        print("Filtering distal mask artifacts before mesh fitting...")
-        filter_result = filter_mask_artifacts_by_component_distance(
-            mask_zyx,
-            geometry,
-            keep_near_main_mm=args.artifact_keep_near_main_mm,
-            remove_distance_mm=args.artifact_remove_distance_mm,
-            max_remove_voxels=args.artifact_max_remove_voxels,
-            connectivity=args.artifact_connectivity,
-        )
-        mask_zyx = filter_result.cleaned_mask
-        artifact_filter_metrics = filter_result.metrics
-        save_mask_like(filter_result.cleaned_mask, reference_image, args.output_dir / "artifact_cleaned_mask.nii.gz")
-        save_mask_like(filter_result.removed_mask, reference_image, args.output_dir / "artifact_removed_mask.nii.gz")
-        save_label_like(
-            filter_result.component_labels,
-            reference_image,
-            args.output_dir / "artifact_component_labels.nii.gz",
-        )
-        print(
-            "Artifact filter removed "
-            f"{artifact_filter_metrics['removed_voxels']} voxels "
-            f"from {len(artifact_filter_metrics['removed_components'])} components"
-        )
+    filtered = filter_artifacts(
+        mask_zyx, geometry, reference_image, args.output_dir, args, stage="mesh fitting"
+    )
+    mask_zyx = filtered.mask
+    artifact_filter_metrics = filtered.metrics
     target_physical, target_faces, target_zyx = extract_surface_from_mask(mask_zyx, geometry)
     norm = make_bbox_normalization(target_physical)
     target_norm = norm.to_norm(target_physical)
@@ -517,133 +398,30 @@ def main() -> None:
 
     mesh_mask = None
     repaired = None
-    if args.geometric_repair_method in {"mesh_path_connect", "mask_endpoint_connect"} and not args.skip_voxelize:
-        if args.geometric_repair_method == "mesh_path_connect":
-            print("Repairing with mesh-guided path connector...")
-        else:
-            print("Repairing with local endpoint connector...")
-        t0 = time.perf_counter()
-        if args.geometric_repair_method == "mesh_path_connect":
-            path_result = repair_mask_with_mesh_paths(
-                mask_zyx,
-                final_vertices_physical,
-                template.faces,
-                template.edge_index,
-                geometry,
-                anchor_mm=args.path_repair_anchor_mm,
-                radius_mm=args.path_repair_radius_mm,
-                max_radius_mm=args.path_repair_max_radius_mm,
-                min_accept_radius_mm=args.path_repair_min_accept_radius_mm,
-                radius_mode=args.path_repair_radius_mode,
-                local_radius_window_mm=args.path_repair_local_radius_window_mm,
-                radius_percentile=args.path_repair_radius_percentile,
-                radius_scale=args.path_repair_radius_scale,
-                min_component_voxels=args.path_repair_min_component_voxels,
-                max_added_fraction=args.path_repair_max_added_fraction,
-                connectivity=args.path_repair_connectivity,
-                path_selection=args.path_repair_selection,
-                min_path_edges=args.path_repair_min_path_edges,
-                max_mesh_edge_mm=args.path_repair_max_mesh_edge_mm,
-                edge_filter_fallback=args.path_repair_edge_filter_fallback,
-            )
-            repair_metrics_key = "mesh_path_repair"
-            repaired_specific_name = "repaired_mask_mesh_path_connect.nii.gz"
-            bridge_name = "mesh_path_bridge_mask.nii.gz"
-            labels_name = "mesh_path_component_labels.nii.gz"
-            precleanup_name = "repaired_mask_mesh_path_connect_precleanup.nii.gz"
-            timings["mesh_path_repair_seconds"] = time.perf_counter() - t0
-        else:
-            path_result = repair_mask_with_endpoint_paths(
-                mask_zyx,
-                final_vertices_physical,
-                template.faces,
-                geometry,
-                max_gap_mm=args.endpoint_repair_max_gap_mm,
-                mesh_support_mm=args.endpoint_repair_mesh_support_mm,
-                min_mesh_support_fraction=args.endpoint_repair_min_mesh_support_fraction,
-                radius_mm=args.path_repair_radius_mm,
-                max_radius_mm=args.path_repair_max_radius_mm,
-                min_accept_radius_mm=args.path_repair_min_accept_radius_mm,
-                radius_mode=args.path_repair_radius_mode,
-                local_radius_window_mm=args.path_repair_local_radius_window_mm,
-                radius_percentile=args.path_repair_radius_percentile,
-                radius_scale=args.path_repair_radius_scale,
-                min_component_voxels=args.path_repair_min_component_voxels,
-                max_added_fraction=args.path_repair_max_added_fraction,
-                connectivity=args.path_repair_connectivity,
-            )
-            repair_metrics_key = "endpoint_repair"
-            repaired_specific_name = "repaired_mask_endpoint_connect.nii.gz"
-            bridge_name = "endpoint_bridge_mask.nii.gz"
-            labels_name = "endpoint_component_labels.nii.gz"
-            precleanup_name = "repaired_mask_endpoint_connect_precleanup.nii.gz"
-            timings["endpoint_repair_seconds"] = time.perf_counter() - t0
-        repaired = path_result.repaired
-        timing_key = "mesh_path_repair_seconds" if args.geometric_repair_method == "mesh_path_connect" else "endpoint_repair_seconds"
-        print(f"Direct repair: {timings[timing_key]:.2f}s")
-        post_cleanup_metrics = None
-        if args.post_repair_cleanup == "remove_mesh_uncovered_components":
-            print("Removing mesh-uncovered leftover components...")
-            t0 = time.perf_counter()
-            save_mask_like(
-                repaired,
-                reference_image,
-                args.output_dir / precleanup_name,
-            )
-            cleanup_result = remove_mesh_uncovered_components(
-                repaired,
-                final_vertices_physical,
-                template.faces,
-                geometry,
-                mesh_distance_mm=args.post_cleanup_mesh_distance_mm,
-                min_close_fraction=args.post_cleanup_min_close_fraction,
-                max_remove_voxels=args.post_cleanup_max_remove_voxels,
-                connectivity=args.post_cleanup_connectivity,
-            )
-            repaired = cleanup_result.cleaned_mask
-            post_cleanup_metrics = cleanup_result.metrics
-            post_cleanup_metrics["removed_original_voxels"] = int((cleanup_result.removed_mask & mask_zyx).sum())
-            save_mask_like(
-                cleanup_result.removed_mask,
-                reference_image,
-                args.output_dir / "post_cleanup_removed_mask.nii.gz",
-            )
-            save_label_like(
-                cleanup_result.component_labels,
-                reference_image,
-                args.output_dir / "post_cleanup_component_labels.nii.gz",
-            )
-            timings["post_repair_cleanup_seconds"] = time.perf_counter() - t0
-            print(
-                "Post-cleanup removed "
-                f"{post_cleanup_metrics['removed_voxels']} voxels "
-                f"from {len(post_cleanup_metrics['removed_components'])} components"
-            )
-
-        t0 = time.perf_counter()
-        save_mask_like(repaired, reference_image, args.output_dir / repaired_specific_name)
-        save_mask_like(path_result.bridge_mask, reference_image, args.output_dir / bridge_name)
-        save_label_like(
-            path_result.component_labels,
+    if args.geometric_repair_method in BRIDGE_METHODS and not args.skip_voxelize:
+        outcome = run_bridge_repair(
+            mask_zyx,
+            final_vertices_physical,
+            template.faces,
+            template.edge_index,
+            geometry,
             reference_image,
-            args.output_dir / labels_name,
+            args.output_dir,
+            args,
+            timings,
+            save_timing_key="save_repair_outputs_seconds",
         )
-        save_mask_like(repaired, reference_image, args.output_dir / "repaired_mask.nii.gz")
-        timings["save_repair_outputs_seconds"] = time.perf_counter() - t0
+        repaired = outcome.repaired
+        print(f"Direct repair: {timings[outcome.names.timing]:.2f}s")
         print(f"Save repair outputs: {timings['save_repair_outputs_seconds']:.2f}s")
 
-        voxel_volume_mm3 = float(np.prod(geometry.spacing_xyz))
-        metrics[repair_metrics_key] = {
-            **path_result.metrics,
-            "original_voxels": int(mask_zyx.sum()),
-            "repaired_voxels": int(repaired.sum()),
-            "added_voxels": int((repaired & ~mask_zyx).sum()),
-            "voxel_volume_mm3": voxel_volume_mm3,
-            "added_volume_mm3": float((repaired & ~mask_zyx).sum() * voxel_volume_mm3),
+        metrics[outcome.names.metrics_key] = {
+            **outcome.repair_metrics,
+            **growth_metrics(mask_zyx, repaired, geometry),
             "geometric_repair_method": args.geometric_repair_method,
         }
-        if post_cleanup_metrics is not None:
-            metrics["post_repair_cleanup"] = post_cleanup_metrics
+        if outcome.cleanup_metrics is not None:
+            metrics["post_repair_cleanup"] = outcome.cleanup_metrics
         args.skip_voxelize = True
     if not args.skip_voxelize:
         print("Voxelizing fitted mesh...")

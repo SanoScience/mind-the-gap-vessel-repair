@@ -10,6 +10,7 @@
 
 [![Paper](https://img.shields.io/badge/Paper-OpenReview-b31b1b)](https://openreview.net/forum?id=BVB2SExfid)
 [![Project page](https://img.shields.io/badge/Project-page-0b6e99)](https://sanoscience.github.io/mind-the-gap-vessel-repair-page/)
+[![Tests](https://github.com/SanoScience/mind-the-gap-vessel-repair/actions/workflows/tests.yml/badge.svg)](https://github.com/SanoScience/mind-the-gap-vessel-repair/actions/workflows/tests.yml)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab)](#installation)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c)](#installation)
 
@@ -18,6 +19,8 @@
 </div>
 
 **One missing voxel bridge splits a vessel in two while barely changing the volume, so Dice stays high and the vessel is still broken.** This repository contains the post-processing framework from our ShapeMI 2026 paper. Given a binary vessel mask predicted by nnU-Net, we fit a deformable template mesh to the mask surface in physical space and use the fitted mesh as a case-specific geometric scaffold. The mesh is **never voxelised as the output**. It only proposes and validates thin bridges between disconnected components, each accepted under a strict foreground-growth budget. Connectivity is restored while voxel accuracy is untouched.
+
+> **Reproducing the paper.** The tag [`v0.1.0-shapemi2026`](https://github.com/SanoScience/mind-the-gap-vessel-repair/releases/tag/v0.1.0-shapemi2026) is the state of the code that produced the published results. Later commits restructure the code without changing what it computes, which the regression tests below check voxel for voxel.
 
 ## Highlights
 
@@ -268,6 +271,27 @@ Each run folder contains the fitted meshes, the repaired masks as NIfTI files wi
 | `qa_overlay.pdf` | Slice overlays for visual inspection (disable with `--disable-qa`) |
 | `metrics.json`, `tensorboard/` | Configuration, per-stage losses, accepted/rejected bridges, added voxels, timings |
 
+## Tests
+
+```bash
+pip install pytest
+pytest tests -m "not golden"
+```
+
+The synthetic tests build small phantoms in memory, a straight tube cut by a gap and
+a triangulated tube standing in for a fitted mesh, and pin the properties the method
+claims: repair reconnects components through the mesh, only ever adds voxels,
+declines bridges that exceed the growth budget, and leaves an already-connected mask
+alone. They need no dataset, no GPU and no deep-learning stack, and run in under a
+second.
+
+A second suite replays finished runs and compares the repaired masks with the stored
+ones voxel for voxel. Because each run records its own parameters in `metrics.json`,
+a run directory is self-describing and the test rebuilds the command line from it.
+Those fixtures are predictions derived from the challenge datasets and cannot be
+redistributed, so they are not in this repository; point the tests at your own
+results as described in [tests/README.md](tests/README.md).
+
 ## Repository layout
 
 ```
@@ -277,6 +301,8 @@ mask_mesh_fit/
   optimize.py                      four-stage decoder optimisation (Lightning or plain loop)
   mesh_deformation_decoder.py      graph-convolutional mesh decoder with bounded per-stage offsets
   losses.py                        Chamfer term and mesh regularisers (MultiGeoMed backend)
+  repair_args.py                   repair command-line flags, shared by both entry points
+  repair_pipeline.py               the repair stage itself, shared by both entry points
   geometry.py, io_utils.py         templates, target surfaces, NIfTI geometry handling
   artifact_filter.py               component-distance filtering of false-positive islands
   mesh_path_repair.py              mesh-graph shortest-path bridges (aorta, TopCoW)
@@ -290,6 +316,7 @@ mask_mesh_fit/
   qa.py                            QA overlay PDFs
 mask_mesh_refine/                  experimental learned refiner (not used in the paper)
 templates/                         anatomy-specific template meshes used in the paper
+tests/                             synthetic tests and the golden-run regression harness
 docs/                              paper figures and technical overview
 ```
 
